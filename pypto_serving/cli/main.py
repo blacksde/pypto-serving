@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import dataclasses
 import json
+import math
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -23,6 +24,8 @@ from pypto_serving.config.parallel import ParallelConfig, parse_device_ids
 from pypto_serving.config.types import (
     PREFILL_CHUNK_SIZE_CHOICES,
     GenerateConfig,
+    KVCacheGroupSpec,
+    KVCacheSpec,
     RuntimeConfig,
 )
 from pypto_serving.model.model_family import detect_model_family, read_model_config
@@ -268,14 +271,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
-    if args.max_num_seqs is None:
-        if args.pd_role:
-            from pypto_serving.pd.config import default_max_num_seqs
-
-            args.max_num_seqs = default_max_num_seqs(args.pd_role)
-        else:
-            args.max_num_seqs = 16
-
     from pypto_serving.serving.engine.async_engine import EngineConfig
 
     model_dir = str(Path(args.model).resolve())
@@ -283,6 +278,17 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.max_num_seqs is None:
+        if args.pd_role:
+            from pypto_serving.pd.config import default_max_num_seqs
+
+            args.max_num_seqs = default_max_num_seqs(args.pd_role)
+            if model_family == "qwen":
+                # The Qwen3-14B decode/topk kernels are compiled for a fixed
+                # kernel BATCH of 16; the DSpark decode default (72) is invalid.
+                args.max_num_seqs = 16
+        else:
+            args.max_num_seqs = 16
     if model_family == "deepseek_v41":
         return _build_v41_engine_config(args, model_dir, model_config_data, devices)
     model_variant = _resolve_model_variant(args)
@@ -505,6 +511,40 @@ def _build_runtime_config(
         prefill_chunk_size_choices = PREFILL_CHUNK_SIZE_CHOICES
         requires_homogeneous_prefill_decode = bool(
             kernel_contract.requires_homogeneous_prefill_decode
+        )
+    elif model_family == "qwen" and args.pd_role:
+        from pypto_serving.model.qwen.npu_executor import _QWEN14B_PAGE_SIZE
+
+        # PD routes one scheduler-visible cache group over the runner's fused
+        # key/value page pools: physical bytes per (layer, block) cover both.
+        if args.block_size != _QWEN14B_PAGE_SIZE:
+            raise ValueError(
+                f"Qwen3-14B PD requires --block-size {_QWEN14B_PAGE_SIZE} (kernel page size)"
+            )
+        if args.max_num_seqs != 16:
+            raise ValueError(
+                "Qwen3-14B PD requires --max-num-seqs 16 "
+                "(fixed decode/topk kernel BATCH)"
+            )
+        config_data = config_data or {}
+        num_hidden_layers = int(config_data.get("num_hidden_layers", 40))
+        num_key_value_heads = int(config_data.get("num_key_value_heads", 8))
+        head_dim = int(config_data.get("head_dim", 0) or
+                       (int(config_data.get("hidden_size", 5120))
+                        // int(config_data.get("num_attention_heads", 40))))
+        itemsize = {"bfloat16": 2, "float16": 2, "float32": 4}.get(kv_dtype)
+        if itemsize is None:
+            raise ValueError(f"unsupported Qwen3 PD KV cache dtype: {kv_dtype}")
+        kv_cache_groups = (
+            KVCacheGroupSpec(
+                name="kv",
+                layer_indices=tuple(range(num_hidden_layers)),
+                spec=KVCacheSpec(
+                    block_size=args.block_size,
+                    page_size_bytes=(2 * num_key_value_heads * args.block_size * head_dim * itemsize),
+                ),
+                max_blocks_per_seq=math.ceil(args.max_model_len / args.block_size),
+            ),
         )
 
     return RuntimeConfig(

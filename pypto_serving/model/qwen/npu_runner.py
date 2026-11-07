@@ -127,10 +127,19 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
+        execution_role: str = "mixed",
+        extension_factory=None,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
+        self._execution_role = execution_role
+        # PD deployments attach a runner extension (transfer runtime) before
+        # the L3 worker exists; it is consulted lazily at worker creation.
+        self.runtime_extension = extension_factory(runner=self) if extension_factory is not None else None
+        # Physical page count per named cache group; empty for the plain
+        # single-pool (non-PD) deployment.
+        self._cache_group_num_blocks: dict[str, int] = {}
         self._init_l3_dispatch(stacked=False)
         # Device-resident decode output scratch (greedy path): allocated directly on
         # the worker (no host copy) so the per-step memset + D2H copy-back of the
@@ -256,6 +265,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             config, runtime, self._shared_l3_worker(), simpler_committed=simpler_committed,
         )
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
+        self._cache_group_num_blocks = {group.name: num_pages for group in runtime.kv_cache_groups}
         self._print_memory_breakdown(
             "after KV cache alloc", config, runtime, num_pages, self._shared_l3_worker(),
         )
@@ -818,11 +828,16 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         if worker is None:
             from pypto.runtime import DistributedWorker  # noqa: PLC0415
 
+            worker_kwargs: dict[str, Any] = {}
+            if self.runtime_extension is not None:
+                worker_kwargs.update(self.runtime_extension.worker_options())
             worker = DistributedWorker([
                 self._compiled.prefill.compiled,
                 self._compiled.decode.compiled,
                 self._compiled.topk_select.compiled,
-            ])
+            ], **worker_kwargs)
+            if self.runtime_extension is not None:
+                self.runtime_extension.worker_ready()
             self._l3_worker = worker
         return worker
 
@@ -883,14 +898,24 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
     def close(self) -> None:
         """Release shared L3 worker resources and clear static tensor caches."""
         try:
-            self.close_kv_cache()
+            if self._l3_worker is not None and self.runtime_extension is not None:
+                # Transfer owners must drain before the worker (and any chip
+                # child they live in) goes away.
+                self.runtime_extension.close()
         finally:
-            worker = self._l3_worker
             try:
-                if worker is not None:
-                    worker.close()
+                self.close_kv_cache()
             finally:
-                self._reset_l3_dispatch()
+                worker = self._l3_worker
+                try:
+                    if worker is not None:
+                        worker.close()
+                finally:
+                    self._reset_l3_dispatch()
+
+    def cache_group_num_blocks(self) -> dict[str, int]:
+        """Physical page count per configured cache group (empty when ungrouped)."""
+        return dict(self._cache_group_num_blocks)
 
     def _prepare_prefill_inputs(
         self,
@@ -942,17 +967,11 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             target[:actual_batch] = values
 
         for batch_idx in range(actual_batch):
-            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             chunk_len = chunk_len_values[batch_idx]
             chunk_start = chunk_start_values[batch_idx]
             chunk_offset = chunk_offset_values[batch_idx]
 
-            if alloc is not None:
-                page_ids = alloc.page_ids
-            elif batch_idx < len(batch.block_ids):
-                page_ids = batch.block_ids[batch_idx]
-            else:
-                page_ids = []
+            page_ids = self._batch_page_ids(batch, batch_idx)
             self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
             self._write_slot_mapping(
@@ -1031,7 +1050,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
         first_page_ids: list[int] | None = None
         for batch_idx in range(actual_batch):
-            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(seq_len_values[batch_idx])
             if seq_len <= 0:
                 raise ValueError("decode seq_lens must be positive")
@@ -1040,12 +1058,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                     f"decode seq_len {seq_len} exceeds max_seq_len {model.runtime.max_seq_len}"
                 )
 
-            if alloc is not None:
-                page_ids = alloc.page_ids
-            elif batch_idx < len(batch.block_ids):
-                page_ids = batch.block_ids[batch_idx]
-            else:
-                page_ids = []
+            page_ids = self._batch_page_ids(batch, batch_idx)
             self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids)
             if batch_idx == 0:
                 first_page_ids = page_ids
@@ -1074,6 +1087,25 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             actual_batch=actual_batch,
             logits=logits_buffer,
         )
+
+    def _batch_page_ids(self, batch, batch_idx: int) -> list[int]:
+        """Select the KV page table for one batch row.
+
+        Grouped (PD) deployments carry pages under the single ``kv`` cache
+        group; plain deployments use KvAllocation page ids or the generic
+        block list.
+        """
+        if batch_idx < len(batch.block_ids_by_group) and batch.block_ids_by_group[batch_idx]:
+            groups = batch.block_ids_by_group[batch_idx]
+            if len(groups) != 1:
+                raise ValueError("Qwen3-14B expects exactly one KV cache group")
+            return next(iter(groups.values()))
+        alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
+        if alloc is not None:
+            return alloc.page_ids
+        if batch_idx < len(batch.block_ids):
+            return batch.block_ids[batch_idx]
+        return []
 
     def _write_cached_decode_block_table_row(
         self,

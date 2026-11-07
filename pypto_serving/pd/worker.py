@@ -26,14 +26,17 @@ logger = logging.getLogger(__name__)
 class WorkerRuntime:
     def __init__(self, settings, model, progress_channel=None):
         self.settings, self.model = settings, model
-        self.owners = tuple(Owner(settings.boot, i, settings.hostname, settings.provider)
-                            for i in range(model.ranks))
+        self.owners = tuple(self._new_owner(rank) for rank in range(model.ranks))
         self.peers, self.peer_fingerprints, self.jobs = {}, {}, {}
         self.registry = None
         self.uncertain = False
         self.pool = ThreadPoolExecutor(max_workers=model.ranks, thread_name_prefix="pd-write")
         self.lock = threading.Lock()
         self.progress_channel, self.progress = progress_channel, None
+
+    def _new_owner(self, rank):
+        """Owner bridge per rank; subclasses may swap in a local provider."""
+        return Owner(self.settings.boot, rank, self.settings.hostname, self.settings.provider)
 
     def start_progress(self):
         # Start only after L3 owners have forked; do not fork a progress thread.

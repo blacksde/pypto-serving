@@ -15,7 +15,10 @@ import logging
 from pathlib import Path
 import uuid
 
-PROVIDERS = {"mooncake": ("pypto_serving.pd.transfer", "Mooncake")}
+PROVIDERS = {
+    "mooncake": ("pypto_serving.pd.transfer", "Mooncake"),
+    "local": ("pypto_serving.pd.local_transfer", "HostTransfer"),
+}
 DEFAULT_CAPACITY = 256
 
 

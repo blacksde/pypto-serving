@@ -128,6 +128,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         platform: str = "a2a3sim",
         device_ids: Sequence[int] = (0,),
         pypto_build_dir: str | None = None,
+        execution_role: str = "mixed",
+        num_speculative_tokens: int = 0,
+        capture_prefill_tail: bool = False,
+        runner_extension_factory=None,
     ) -> None:
         # ``pypto_build_dir`` is an explicit diagnostic/output request (set by
         # the serving worker only when the user asks for build output); it
@@ -139,6 +143,15 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             device_ids=device_ids,
             pypto_build_dir=pypto_build_dir,
         )
+        if execution_role not in ("mixed", "prefill", "decode"):
+            raise ValueError("invalid Qwen3 execution role")
+        if num_speculative_tokens != 0:
+            raise ValueError("Qwen3-14B PD does not use speculative decoding")
+        self._execution_role = execution_role
+        # The first handoff token is the prefill's sampled output and rides the
+        # normal engine token stream, so no device prompt-tail capture exists.
+        self._capture_prefill_tail = bool(capture_prefill_tail)
+        self._runner_extension_factory = runner_extension_factory
         self._compiler = KernelCompiler(
             run_config=build_pypto_run_config(
                 platform=self._platform,
@@ -169,7 +182,18 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            execution_role=self._execution_role,
+            extension_factory=self._runner_extension_factory,
         )
+
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        """Report the physical KV page count for grouped (PD) deployments."""
+        return dict(self._runners[model_id].cache_group_num_blocks())
+
+    def runtime_extensions(self):
+        """Return explicitly configured runner services after model registration."""
+        return tuple(runner.runtime_extension for runner in self._runners.values()
+                     if runner.runtime_extension is not None)
 
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""

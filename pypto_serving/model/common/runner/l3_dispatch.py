@@ -43,7 +43,26 @@ from pypto_serving.tools.profile import profile_span
 
 from .buffer_set import resolve_l3_arg
 
-__all__ = ["L3DispatchMixin", "PendingL3Dispatch"]
+__all__ = ["L3DispatchMixin", "PendingL3Dispatch", "device_gate"]
+
+_GATE_CREATE_LOCK = threading.Lock()
+
+
+def device_gate(worker: Any) -> threading.Lock:
+    """Per-worker lock serializing standalone device control with dispatches.
+
+    The L3 worker rejects device control (PD KV copies, buffer frees) while a
+    run is in flight; dispatches hold this gate from submission until their
+    run settles, so gate holders can never observe a live run and the
+    worker's ordering rules are satisfied without racing a step.
+    """
+    gate = getattr(worker, "pd_device_gate", None)
+    if gate is None:
+        with _GATE_CREATE_LOCK:
+            gate = getattr(worker, "pd_device_gate", None)
+            if gate is None:
+                gate = worker.pd_device_gate = threading.Lock()  # type: ignore[attr-defined]
+    return gate
 
 
 @dataclass
@@ -54,6 +73,7 @@ class PendingL3Dispatch:
     handle: Any
     uploaded: tuple[Any, ...]
     name: str
+    gate: Any = None
     _released: bool = False
     _error: BaseException | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -75,6 +95,10 @@ class PendingL3Dispatch:
                     self.handle.result()
             except BaseException as exc:
                 error = exc
+            finally:
+                # The run has settled; standalone device control may resume.
+                if self.gate is not None:
+                    self.gate.release()
             for tensor in self.uploaded:
                 try:
                     self.worker.free_tensor(tensor)
@@ -168,9 +192,10 @@ class L3DispatchMixin:
                     level="kernel",
                     args=dict(span_args),
                 ):
-                    worker.run(
-                        callable_spec.compiled, *l3_args, config=run_config,
-                    )
+                    with device_gate(worker):
+                        worker.run(
+                            callable_spec.compiled, *l3_args, config=run_config,
+                        )
             finally:
                 for tensor in uploaded:
                     worker.free_tensor(tensor)
@@ -205,15 +230,21 @@ class L3DispatchMixin:
                 )
                 for arg in args
             )
+            gate = device_gate(worker)
             with profile_span(
                 f"{callable_spec.name}.worker_submit",
                 cat="kernel",
                 level="kernel",
                 args=dict(span_args),
             ):
-                handle = worker.submit(
-                    callable_spec.compiled, *l3_args, config=run_config,
-                )
+                gate.acquire()
+                try:
+                    handle = worker.submit(
+                        callable_spec.compiled, *l3_args, config=run_config,
+                    )
+                except BaseException:
+                    gate.release()
+                    raise
         except BaseException:
             for tensor in uploaded:
                 worker.free_tensor(tensor)
@@ -223,6 +254,7 @@ class L3DispatchMixin:
             handle=handle,
             uploaded=tuple(uploaded),
             name=callable_spec.name,
+            gate=gate,
         )
 
     def _reset_l3_dispatch(self) -> None:

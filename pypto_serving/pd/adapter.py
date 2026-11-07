@@ -38,6 +38,139 @@ TENSORS = dict(zip((c.name for c in CACHE_COMPONENTS), (
     "hca_compress_state", "csa_compress_state", "csa_inner_compress_state")))
 
 
+class _SingleShard:
+    """Present one DeviceTensor as the shard tuple WorkerRuntime registers."""
+
+    __slots__ = ("shards",)
+
+    def __init__(self, tensor):
+        self.shards = (tensor,)
+
+
+class Qwen3:
+    """P/D semantics for the single-device Qwen3-14B paged KV cache.
+
+    Key and value live in two identically shaped flat pools whose physical
+    layout ``[layer][page][kv head][token][head dim]`` is exactly the byte
+    range the protocol plans for one component geometry, so both share the
+    ``kv`` cache group and transfer as raw page byte ranges. The model is not
+    speculative: the prefill's sampled first token is the only state D needs,
+    so there are no final components and no device tail capture.
+    """
+
+    SPECULATIVE_TOKENS = 0
+    COMPONENTS = (Component("key", "kv", "kv"), Component("value", "kv", "kv"))
+
+    @staticmethod
+    def mapping(source_topology, destination_topology, source_partition, destination_partition):
+        return rank_mapping(source_topology, destination_topology, source_partition, destination_partition)
+
+    @staticmethod
+    def validate_mapping(source_topology, destination_topology, placement, mapping):
+        if not mapping:
+            raise ValueError("missing rank mapping")
+        if mapping != rank_mapping(source_topology, destination_topology,
+                                   source_topology.partition(mapping[0][0]), placement.partition):
+            raise ValueError("invalid Qwen3 partition/TP slot mapping")
+
+    def contract(self, model, geometry):
+        if {g.name for g in geometry} != {c.name for c in self.COMPONENTS}:
+            raise ValueError("Qwen3 requires key/value cache regions")
+        geometry = {g.name: g for g in geometry}
+        key, value = geometry["key"], geometry["value"]
+        if ((key.layers, key.blocks, key.rows, key.row_bytes, key.dtype)
+                != (value.layers, value.blocks, value.rows, value.row_bytes, value.dtype)):
+            raise ValueError("Qwen3 key/value geometry mismatch")
+        layout = digest(tuple(geometry[c.name].layout for c in self.COMPONENTS))
+        return Contract("qwen3-14b-paged", model, layout, self.COMPONENTS)
+
+    def prefix_spec(self, tokens, cache):
+        hashes = (cache.compute_group_block_hashes(list(tokens), group_names=("kv",))
+                  if cache.enable_prefix_cache else {})
+        return Prefix(len(tokens), cache.group_prefix_cache_alignment,
+                      {k: tuple(h.hex() for h in values) for k, values in hashes.items()})
+
+    @staticmethod
+    def validate(config):
+        if config.temperature != 0.0 or config.top_p != 1.0 or config.top_k is not None:
+            raise ValueError("Qwen3 PD requires greedy sampling")
+
+    @staticmethod
+    def worker_factory(**kwargs):
+        return Qwen3Extension(**kwargs)
+
+
+class Qwen3Extension:
+    """Runner-side PD services for one Qwen3-14B model."""
+
+    def __init__(self, *, settings, runner, progress_channel=None):
+        self.runner = runner
+        self.ranks = 1  # single-device cache owner per node
+        self.tp = 1
+        self.worker = runner._shared_l3_worker
+        if settings.provider == "local":
+            from .local_transfer import HostWorkerRuntime
+
+            self.transfer = HostWorkerRuntime(settings, self, progress_channel)
+        else:
+            self.transfer = WorkerRuntime(settings, self, progress_channel)
+
+    def _pool(self):
+        return self.runner._active_kv_cache
+
+    def _model_spec(self):
+        model_id = next(iter(self.runner._kv_caches))
+        return self.runner._pending_kv_cache_specs[model_id]
+
+    def regions(self):
+        pool = self._pool()
+        return {"key": _SingleShard(pool.key_pages), "value": _SingleShard(pool.value_pages)}
+
+    def geometry(self):
+        pool = self._pool()
+        config, runtime = self._model_spec()
+        layers = tuple(range(config.num_hidden_layers))
+        rows = config.num_key_value_heads * runtime.page_size
+        shard = pool.key_pages
+        if (shard.shape != pool.value_pages.shape or shard.dtype != pool.value_pages.dtype
+                or len(shard.shape) != 2 or not layers or shard.shape[0] % (len(layers) * rows)):
+            raise ValueError("invalid Qwen3 key/value pool layout")
+        blocks = shard.shape[0] // (len(layers) * rows)
+        row_bytes = shard.shape[1] * _torch_dtype_size(shard.dtype)
+        return (Geometry("key", layers, blocks, rows, row_bytes, str(shard.dtype)),
+                Geometry("value", layers, blocks, rows, row_bytes, str(pool.value_pages.dtype)))
+
+    def worker_options(self):
+        return self.transfer.worker_options()
+
+    def worker_ready(self):
+        self.transfer.worker_ready()
+
+    def handle(self, operation, value):
+        # Qwen3 has no speculative state: D resumes from the sampled first
+        # token carried by the protocol, so every state operation is empty.
+        if operation == "reserve_state":
+            return {}
+        if operation == "source_state":
+            return {}
+        if operation == "discard_state":
+            return None
+        raise ValueError("unknown model operation")
+
+    def set_profile_active(self, active):
+        for owner in self.transfer.owners:
+            owner.call("profile", active=active)
+
+    def close(self):
+        self.transfer.close()
+
+
+def _torch_dtype_size(dtype):
+    import torch
+
+    return torch.empty((), dtype=dtype).element_size()
+
+
 class DeepSeekDSpark:
     @staticmethod
     def mapping(source_topology, destination_topology, source_partition, destination_partition):
@@ -78,7 +211,7 @@ class DeepSeekDSpark:
         return DSparkExtension(**kwargs)
 
 
-ADAPTERS = {"PyptoDeepSeekV4DSparkExecutor": DeepSeekDSpark}
+ADAPTERS = {"PyptoDeepSeekV4DSparkExecutor": DeepSeekDSpark, "PyptoQwen14BExecutor": Qwen3}
 
 
 def select_adapter(executor):

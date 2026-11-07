@@ -57,6 +57,10 @@ class Provider(Protocol):
 
 
 class Mooncake:
+    #: Mooncake moves bytes through chip-child services and needs the PyPTO
+    #: chip_service_factories/retain_service_tensor interfaces.
+    REQUIRES_CHIP_SERVICES = True
+
     @staticmethod
     def check_available():
         # Import in a disposable process, before weights/fork, without starting an engine.

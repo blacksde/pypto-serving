@@ -185,8 +185,9 @@ class Application:
     def __init__(self, engine_config, config, role, endpoint, tokenizer, generate):
         self.boot = uuid.uuid4().hex
         self.adapter = select_adapter(engine_config.executor_cls)
-        if engine_config.runtime_config.num_speculative_tokens != 7:
-            raise ValueError("PD deployment requires the K7 model configuration")
+        speculative = getattr(self.adapter, "SPECULATIVE_TOKENS", 7)
+        if engine_config.runtime_config.num_speculative_tokens != speculative:
+            raise ValueError("PD deployment requires the model's PD token configuration")
         self.config = config
         progress = channel = None
         if role == "prefill":
@@ -195,7 +196,7 @@ class Application:
         self.channel, self.progress = channel, progress
         settings = WorkerSettings(self.boot, endpoint.transfer_hostname or endpoint.host,
                                   config.provider, config.capacity, len(config.prefill) + len(config.decode))
-        tokens = 0 if role == "prefill" else 7
+        tokens = 0 if role == "prefill" else speculative
         engine_config = replace(engine_config,
             runtime_config=replace(engine_config.runtime_config, num_speculative_tokens=tokens),
             executor_kwargs={**engine_config.executor_kwargs, "num_speculative_tokens": tokens,
@@ -278,14 +279,20 @@ def run(args, engine_config, generate):
     if args.prompt or not args.pd_config:
         raise ValueError("PD requires --pd-config and online serving")
     config = Config.load(args.pd_config)
-    if not hasattr(os, "pidfd_open"):
-        raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
-    from pypto.runtime.distributed_runner import DistributedWorker
-    if ("chip_service_factories" not in signature(DistributedWorker).parameters
-            or not all(hasattr(DistributedWorker, name)
-                       for name in ("retain_service_tensor", "release_service_tensor"))):
-        raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
-    provider_class(config.provider).check_available()
+    provider = provider_class(config.provider)
+    if getattr(provider, "REQUIRES_CHIP_SERVICES", True):
+        # Chip-service providers drive owners inside forked L3 children: they
+        # need the PyPTO owner-service interfaces and the pidfd health watcher
+        # for those children. Host-staged providers run in-process and use
+        # neither.
+        if not hasattr(os, "pidfd_open"):
+            raise ValueError("PD model nodes require Linux Python with os.pidfd_open")
+        from pypto.runtime.distributed_runner import DistributedWorker
+        if ("chip_service_factories" not in signature(DistributedWorker).parameters
+                or not all(hasattr(DistributedWorker, name)
+                           for name in ("retain_service_tensor", "release_service_tensor"))):
+            raise ValueError("PyPTO lacks the required owner-service and tensor-retain interfaces")
+    provider.check_available()
     logging.basicConfig(level=logging.INFO)
     configure_runtime_logging()
     configure_profiler(engine_config.profile_config, process_name="pd-api", initially_active=False)

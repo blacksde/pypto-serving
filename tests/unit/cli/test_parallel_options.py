@@ -20,8 +20,8 @@ def _parse_cli_args(argv: list[str]):
 
 
 @pytest.mark.parametrize(("role", "specified", "expected"), [
-    (None, None, 16), ("prefill", None, 16), ("decode", None, 72),
-    (None, 32, 32), ("prefill", 8, 8), ("decode", 16, 16),
+    (None, None, 16), ("prefill", None, 16), ("decode", None, 16),
+    (None, 32, 32), ("prefill", 16, 16), ("decode", 16, 16),
 ])
 def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, specified, expected):
     model = tmp_path / "model"
@@ -34,6 +34,16 @@ def test_request_capacity_defaults_reach_scheduler_and_cache(tmp_path, role, spe
     config = cli.build_serving_engine_config(_parse_cli_args(argv))
     assert config.max_num_running_reqs == expected
     assert config.runtime_config.max_batch_size == expected
+
+
+def test_qwen_pd_rejects_capacity_off_the_fixed_kernel_batch(tmp_path):
+    """Qwen3-14B PD nodes must run the decode/topk kernel BATCH of 16."""
+    model = tmp_path / "model"
+    model.mkdir()
+    for role in ("prefill", "decode"):
+        argv = ["--model", str(model), "--pd-role", role, "--max-num-seqs", "8"]
+        with pytest.raises(ValueError, match="fixed decode/topk kernel BATCH"):
+            cli.build_serving_engine_config(_parse_cli_args(argv))
 
 
 def test_cli_keeps_generic_model_chunk_sizes_unrestricted():
