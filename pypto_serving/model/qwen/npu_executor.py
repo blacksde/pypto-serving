@@ -182,6 +182,10 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
             hbg_prefill=self._chip_runtime == "host_build_graph",
         )
 
+    def cache_group_sizes(self, model_id: str) -> dict[str, int]:
+        """Report the device page count for the local session cache group."""
+        return dict(self._runners[model_id].cache_group_num_blocks())
+
     def _compile_model(self, model: RuntimeModel) -> _CompiledKernels:
         """Compile Qwen3-14B PyPTO kernels and pack runtime artifacts."""
         self._configure_compiler(model.runtime.chip_runtime)

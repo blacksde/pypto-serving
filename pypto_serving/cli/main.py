@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import dataclasses
 import json
+import math
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -213,6 +214,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pd-node-id", default=None, help="Select a node when its role has multiple endpoints.")
 
     # Serving
+    parser.add_argument(
+        "--enable-native-sessions",
+        action="store_true",
+        help="Enable the local PostgreSQL-backed session path for single-rank Qwen3.",
+    )
+    parser.add_argument(
+        "--session-kv-mode",
+        choices=("input",),
+        default="input",
+        help="Retain the completed input prefix for local sessions.",
+    )
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind the serving server (default: 0.0.0.0).")
     parser.add_argument("--port", type=int, default=8000, help="Port for the serving server (default: 8000).")
     parser.add_argument(
@@ -286,6 +298,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     _validate_backend(args.backend)
+    if os.getenv("PYPTO_SESSION_DATABASE_URL") and not args.enable_native_sessions:
+        raise ValueError("PYPTO_SESSION_DATABASE_URL requires --enable-native-sessions")
+    if args.enable_native_sessions and not os.getenv("PYPTO_SESSION_DATABASE_URL"):
+        raise ValueError("--enable-native-sessions requires PYPTO_SESSION_DATABASE_URL")
+    if args.enable_native_sessions and not os.getenv("PYPTO_SESSION_SECRET"):
+        raise ValueError("--enable-native-sessions requires PYPTO_SESSION_SECRET")
     if args.max_num_seqs is None:
         if args.pd_role:
             from pypto_serving.pd.config import default_max_num_seqs
@@ -301,6 +319,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
+    if args.enable_native_sessions and (model_family != "qwen" or len(devices) != 1 or args.prompt):
+        raise ValueError("Local sessions require a single-rank Qwen3 serving deployment")
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
@@ -349,7 +369,9 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     worker_device_ids = first_group if parallel_config.num_replicas == 1 else ()
     # DSpark rebuilds its private drafter context from a prefilled suffix.
     # Arbitrary-depth MTP still lacks a grouped prefix-cache contract.
-    enable_prefix_cache = args.enable_prefix_caching
+    # Local sessions mount only the parent receipt. Ordinary prefix lookup
+    # would make a cold/strict decision depend on unrelated cache entries.
+    enable_prefix_cache = args.enable_prefix_caching and not args.enable_native_sessions
     if model_family == "deepseek_v4" and (
         num_speculative_tokens > 1 and model_variant != "dspark"
     ):
@@ -552,6 +574,34 @@ def _build_runtime_config(
         prefill_chunk_size_choices = PREFILL_CHUNK_SIZE_CHOICES
         requires_homogeneous_prefill_decode = bool(
             kernel_contract.requires_homogeneous_prefill_decode
+        )
+    elif model_family == "qwen" and args.enable_native_sessions:
+        from pypto_serving.config.types import KVCacheGroupSpec, KVCacheSpec
+        from pypto_serving.model.qwen.npu_executor import _QWEN14B_PAGE_SIZE
+
+        if args.block_size != _QWEN14B_PAGE_SIZE:
+            raise ValueError(f"Local Qwen sessions require --block-size {_QWEN14B_PAGE_SIZE}")
+        config_data = config_data or {}
+        num_hidden_layers = int(config_data.get("num_hidden_layers", 40))
+        num_key_value_heads = int(config_data.get("num_key_value_heads", 8))
+        head_dim = int(config_data.get("head_dim", 0) or (
+            int(config_data.get("hidden_size", 5120))
+            // int(config_data.get("num_attention_heads", 40))
+        ))
+        itemsize = {"bfloat16": 2, "float16": 2, "float32": 4}.get(kv_dtype)
+        if itemsize is None:
+            raise ValueError(f"unsupported Qwen KV cache dtype: {kv_dtype}")
+        kv_cache_groups = (
+            KVCacheGroupSpec(
+                name="kv",
+                layer_indices=tuple(range(num_hidden_layers)),
+                spec=KVCacheSpec(
+                    block_size=args.block_size,
+                    page_size_bytes=2 * num_key_value_heads * args.block_size * head_dim * itemsize,
+                ),
+                max_blocks_per_seq=math.ceil(args.max_model_len / args.block_size),
+                max_requests_per_partition=args.max_num_seqs,
+            ),
         )
 
     runtime = RuntimeConfig(
@@ -909,6 +959,8 @@ def run_serve(
     *,
     host: str = "0.0.0.0",
     port: int = 8000,
+    native_sessions: bool = False,
+    session_kv_mode: str = "input",
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -929,12 +981,32 @@ def run_serve(
         initially_active=False,
     )
     tokenizer = load_tokenizer(config.model_dir)
-    async_engine = AsyncLLMEngine(
-        config=config,
-        tokenizer=tokenizer
-    )
+    native_server = None
+    if native_sessions:
+        from functools import partial
+        from pypto_serving.serving.engine.async_engine import ReplicaEngineCore
+        from pypto_serving.serving.server.native import NativeServer, SessionScheduler
 
-    app = create_serving_app(async_engine, model_id, generate_config)
+        if not os.getenv("PYPTO_STATEFUL_INTERNAL_TOKEN"):
+            raise ValueError("Local sessions require PYPTO_STATEFUL_INTERNAL_TOKEN")
+        async_engine = AsyncLLMEngine(
+            config=config,
+            tokenizer=tokenizer,
+            core_factory=partial(
+                ReplicaEngineCore,
+                scheduler_factory=partial(SessionScheduler, session_kv_mode=session_kv_mode),
+            ),
+        )
+        native_server = NativeServer(
+            async_engine,
+            model_id,
+            generate_config,
+            session_kv_mode=session_kv_mode,
+        )
+        app = native_server.app
+    else:
+        async_engine = AsyncLLMEngine(config=config, tokenizer=tokenizer)
+        app = create_serving_app(async_engine, model_id, generate_config)
 
     @app.on_event("startup")
     async def startup():
@@ -942,6 +1014,8 @@ def run_serve(
 
     @app.on_event("shutdown")
     async def shutdown():
+        if native_server is not None and native_server.objects is not None:
+            native_server.objects.close()
         await async_engine.stop()
         merge_profile()
 
@@ -1161,6 +1235,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             generate_config,
             host=args.host,
             port=args.port,
+            native_sessions=args.enable_native_sessions,
+            session_kv_mode=args.session_kv_mode,
         )
     return 0
 

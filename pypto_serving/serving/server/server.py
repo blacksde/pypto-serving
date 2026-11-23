@@ -13,10 +13,13 @@ import asyncio
 import contextlib
 import dataclasses
 import importlib.util
+import hashlib
 import json
 import logging
 import time
 import uuid
+
+from pypto_serving.serving import request_timing as timing
 from typing import Literal
 
 from pypto_serving.config.types import GenerateConfig
@@ -25,6 +28,7 @@ from pypto_serving.serving.constraints import ConstraintSpec
 from pypto_serving.serving.constraints.provider import XGrammarProvider
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, TokenOutput
 from pypto_serving.serving.reasoning import OutputParserSpec, ToolCallDelta, supports_tool_calls
+from .session_protocol import StatefulContext
 from pypto_serving.tools.profile import (
     get_profiler,
     merge_profile,
@@ -41,7 +45,7 @@ ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "
 try:
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse, Response, StreamingResponse
-    from pydantic import BaseModel, Field, model_serializer, model_validator
+    from pydantic import AliasChoices, BaseModel, Field, field_validator, model_serializer, model_validator
 except ImportError as e:
     raise ImportError(
         "Serving requires fastapi and pydantic. Install with: pip install fastapi uvicorn sse-starlette pydantic"
@@ -90,9 +94,23 @@ class ToolCall(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: str | None = None
-    reasoning: str | None = None
+    reasoning: str | None = Field(default=None, validation_alias=AliasChoices("reasoning", "reasoning_content"))
     tool_calls: list[ToolCall] | None = None
     tool_call_id: str | None = None
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def _normalize_text_parts(cls, value):
+        """Accept Chat text parts, including gateway-restored assistant history."""
+        if not isinstance(value, list):
+            return value
+        parts = []
+        for part in value:
+            if (not isinstance(part, dict) or part.get("type") != "text"
+                    or not isinstance(part.get("text"), str)):
+                raise ValueError("content parts must contain only text items with string text")
+            parts.append(part["text"])
+        return "".join(parts)
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -126,6 +144,7 @@ class ChatDelta(ChatMessage):
 
 
 class ChatCompletionRequest(BaseModel):
+    stateful_context: StatefulContext | None = None
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int | None = None
@@ -206,6 +225,7 @@ class ServingServer:
         # back to this config; explicit per-request fields still win.
         self.generate_config = generate_config
         self.app = FastAPI(title="PyPTO Serving")
+        self.app.add_middleware(timing.TimingMiddleware, component="pypto")
         self._profile_lock = asyncio.Lock()
         self._constraint_preflight_lock = asyncio.Lock()
         self._constraint_preflight_provider: XGrammarProvider | None = None
@@ -393,6 +413,7 @@ class ServingServer:
             )
             return JSONResponse(response.model_dump())
 
+    @timing.timed("chat.prepare")
     async def prepare_chat(self, request):
         output_parser_spec = self._output_parser_spec(request)
         constraint_spec = self._constraint_spec(request, output_parser_spec)
@@ -409,6 +430,8 @@ class ServingServer:
         return prompt, config, output_parser_spec, constraint_spec
 
     async def _chat_completions(self, request: ChatCompletionRequest) -> StreamingResponse | JSONResponse:
+        if request.stateful_context is not None:
+            raise ValueError("Session mode requires an enabled single-rank native server")
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         prompt, config, output_parser_spec, constraint_spec = await self.prepare_chat(request)
         return await self.chat_response(request_id, request, prompt, config, output_parser_spec, constraint_spec)
@@ -600,6 +623,8 @@ class ServingServer:
                             finish_reason=finish_reason,
                         )],
                     )
+                    if delta or reasoning_delta:
+                        timing.mark("server.first_content")
                     yield f"data: {json.dumps(chunk.model_dump())}\n\n"
 
                     if output.finished:
@@ -657,13 +682,26 @@ class ServingServer:
         hf_messages = [m.model_dump(exclude_none=True) for m in messages]
         for original, message in zip(messages, hf_messages):
             message["content"] = original.content
+        kwargs = self._effective_chat_kwargs(chat_template_kwargs, reasoning_effort, tools)
+        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+
+    @classmethod
+    def _effective_chat_kwargs(cls, chat_template_kwargs, reasoning_effort, tools):
         kwargs: dict = {"tokenize": False, "add_generation_prompt": True}
-        kwargs.update(self._chat_kwargs(chat_template_kwargs, reasoning_effort))
+        kwargs.update(cls._chat_kwargs(chat_template_kwargs, reasoning_effort))
         if tools:
             kwargs["tools"] = [tool.model_dump(exclude_none=True) for tool in tools]
         kwargs["tokenize"] = False
         kwargs["add_generation_prompt"] = True
-        return self.engine.tokenizer.apply_chat_template(hf_messages, **kwargs)
+        return kwargs
+
+    def rendering_profile(self, request: ChatCompletionRequest) -> dict:
+        """Identify the selected template and the exact arguments used to render it."""
+        kwargs = self._effective_chat_kwargs(request.chat_template_kwargs, request.reasoning_effort, request.tools)
+        template = self.engine.tokenizer.tokenizer.get_chat_template(
+            chat_template=kwargs.get("chat_template"), tools=kwargs.get("tools"))
+        encoded = json.dumps(template, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        return dict(template_digest=hashlib.sha256(encoded).hexdigest(), kwargs=kwargs)
 
     @staticmethod
     def _chat_kwargs(chat_template_kwargs: dict | None, reasoning_effort: str | None) -> dict:

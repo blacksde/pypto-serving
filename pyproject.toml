@@ -16,10 +16,11 @@ dependencies = []
 
 [project.optional-dependencies]
 pd = ["fastapi", "httpx", "msgspec>=0.19", "uvicorn"]
+session = ["pypto-session-state>=0.1,<0.2", "fastapi", "uvicorn"]
 
 [project.urls]
-Repository = "https://github.com/hw-native-sys/pypto-serving"
-Issues = "https://github.com/hw-native-sys/pypto-serving/issues"
+Repository = "https://github.com/blacksde/pypto-serving"
+Issues = "https://github.com/blacksde/pypto-serving/issues"
 
 [project.scripts]
 pypto-serving = "pypto_serving.cli.main:main"

@@ -133,6 +133,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         self._compiled = compiled
         self._device_id = device_id
         self._hbg_prefill = hbg_prefill
+        self._cache_group_num_blocks: dict[str, int] = {}
         self._init_l3_dispatch(stacked=False)
         # Device-resident decode output scratch (greedy path): allocated directly on
         # the worker (no host copy) so the per-step memset + D2H copy-back of the
@@ -258,6 +259,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             config, runtime, self._shared_l3_worker(), simpler_committed=simpler_committed,
         )
         num_pages = self._alloc_kv_cache_with_retry(model_id, config, runtime, num_pages)
+        self._cache_group_num_blocks = {group.name: num_pages for group in runtime.kv_cache_groups}
         self._print_memory_breakdown(
             "after KV cache alloc", config, runtime, num_pages, self._shared_l3_worker(),
         )
@@ -898,6 +900,10 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             finally:
                 self._reset_l3_dispatch()
 
+    def cache_group_num_blocks(self) -> dict[str, int]:
+        """Return physical page counts for configured cache groups."""
+        return dict(self._cache_group_num_blocks)
+
     def _prepare_prefill_inputs(
         self,
         model: RuntimeModel,
@@ -948,17 +954,11 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             target[:actual_batch] = values
 
         for batch_idx in range(actual_batch):
-            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             chunk_len = chunk_len_values[batch_idx]
             chunk_start = chunk_start_values[batch_idx]
             chunk_offset = chunk_offset_values[batch_idx]
 
-            if alloc is not None:
-                page_ids = alloc.page_ids
-            elif batch_idx < len(batch.block_ids):
-                page_ids = batch.block_ids[batch_idx]
-            else:
-                page_ids = []
+            page_ids = self._batch_page_ids(batch, batch_idx)
             self._write_block_table_row(block_table, batch_idx, max_blocks, page_ids)
 
             self._write_slot_mapping(
@@ -1037,7 +1037,6 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
 
         first_page_ids: list[int] | None = None
         for batch_idx in range(actual_batch):
-            alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
             seq_len = int(seq_len_values[batch_idx])
             if seq_len <= 0:
                 raise ValueError("decode seq_lens must be positive")
@@ -1046,12 +1045,7 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
                     f"decode seq_len {seq_len} exceeds max_seq_len {model.runtime.max_seq_len}"
                 )
 
-            if alloc is not None:
-                page_ids = alloc.page_ids
-            elif batch_idx < len(batch.block_ids):
-                page_ids = batch.block_ids[batch_idx]
-            else:
-                page_ids = []
+            page_ids = self._batch_page_ids(batch, batch_idx)
             self._write_cached_decode_block_table_row(block_table_rows, batch_idx, page_ids)
             if batch_idx == 0:
                 first_page_ids = page_ids
@@ -1080,6 +1074,20 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
             actual_batch=actual_batch,
             logits=logits_buffer,
         )
+
+    def _batch_page_ids(self, batch, batch_idx: int) -> list[int]:
+        """Resolve the physical page table for grouped and generic requests."""
+        if batch_idx < len(batch.block_ids_by_group) and batch.block_ids_by_group[batch_idx]:
+            groups = batch.block_ids_by_group[batch_idx]
+            if len(groups) != 1:
+                raise ValueError("Qwen3-14B expects exactly one KV cache group")
+            return next(iter(groups.values()))
+        alloc = batch.kv_allocations[batch_idx] if batch_idx < len(batch.kv_allocations) else None
+        if alloc is not None:
+            return alloc.page_ids
+        if batch_idx < len(batch.block_ids):
+            return batch.block_ids[batch_idx]
+        return []
 
     def _write_cached_decode_block_table_row(
         self,
