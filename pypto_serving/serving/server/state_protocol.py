@@ -1,5 +1,5 @@
 # Copyright (c) PyPTO Contributors.
-"""Small local identity protocol for single-rank session KV ownership."""
+"""Small local identity protocol for session KV ownership and topology."""
 
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib

@@ -94,7 +94,7 @@ class SessionRuntime:
             await asyncio.gather(self.background, return_exceptions=True)
         while not self.candidates.empty():
             receipt, _, _, _, _ = self.candidates.get_nowait()
-            self.server._objects().release(receipt)
+            self.server.release_receipt(receipt)
         await self.db(self.store.close)
         self.token_executor.shutdown(wait=True)
         self.db_executor.shutdown(wait=True)
@@ -120,16 +120,18 @@ class SessionRuntime:
                                 )
                     finally:
                         if not published:
-                            self.server._objects().release(receipt)
+                            self.server.release_receipt(receipt)
                         self.candidates.task_done()
                 await self.db(self.store.sweep)
                 for job in await self.db(self.store.claim_releases):
-                    objects = self.server._objects()
                     binding = job["binding"]
                     # A previous boot's volatile pages no longer exist. Never
                     # send its naked page IDs to a new owner.
-                    if binding["boot"] == objects.node.boot and binding["registry"] == objects.node.registry:
-                        objects.release(binding)
+                    replica_idx = self.server.replica_for_receipt(binding)
+                    if replica_idx is not None:
+                        objects = self.server._objects(replica_idx)
+                        if binding["boot"] == objects.node.boot and binding["registry"] == objects.node.registry:
+                            self.server.release_receipt(binding)
                     await self.db(self.store.ack_release, job["id"], job["claim"])
             except asyncio.CancelledError:
                 raise
@@ -288,15 +290,19 @@ class SessionRuntime:
         from .native import SingleBinding
 
         tokens, config, parser, constraint, rendering = prepared
-        objects = self.server._objects()
         ctx = request.stateful_context
+        parent_receipt = parent.binding if parent else None
+        replica_idx = self.server.replica_for_receipt(parent_receipt) if parent_receipt else None
+        if replica_idx is None:
+            replica_idx = self.server.select_replica()
+        core = self.server._cores[replica_idx]
+        objects = self.server._objects(replica_idx)
         salt = hmac.new(self.secret.encode(), ctx.tenant_id.encode(), hashlib.sha256).hexdigest()
         scope = dict(
             tenant_id=ctx.tenant_id,
             cache_salt_digest=hashlib.sha256(salt.encode()).hexdigest(),
             version_id=execution.owner,
         )
-        parent_receipt = parent.binding if parent else None
         prefix, temporary_pin = None, None
         selection = "first" if parent is None else "cold"
         if parent is not None:
@@ -329,7 +335,7 @@ class SessionRuntime:
             error=None,
             done=asyncio.Event(),
         )
-        self.server.core.scheduler.native_requests[rid] = entry
+        core.scheduler.native_requests[rid] = entry
 
         def queued():
             nonlocal temporary_pin
@@ -337,7 +343,7 @@ class SessionRuntime:
                 objects.cache.release_group_block_snapshot(temporary_pin)
                 temporary_pin = None
 
-        outputs = self.server.core.add_request(
+        outputs = core.add_request(
             rid,
             "",
             config,
@@ -487,7 +493,7 @@ class SessionRuntime:
                     await outputs.aclose()
                 finally:
                     queued()
-                    self.server.core.scheduler.native_requests.pop(rid, None)
+                    core.scheduler.native_requests.pop(rid, None)
                     try:
                         # Disconnection cannot cancel synchronous SQL. Resolve
                         # its bounded commit before transferring candidate ownership.

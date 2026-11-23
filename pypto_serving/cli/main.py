@@ -217,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable-native-sessions",
         action="store_true",
-        help="Enable the local PostgreSQL-backed session path for single-rank Qwen3.",
+        help="Enable the local PostgreSQL-backed session path with a model KV adapter.",
     )
     parser.add_argument(
         "--session-kv-mode",
@@ -319,8 +319,8 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     devices = parse_device_ids(args.devices, default_device=args.device)
     model_config_data = read_model_config(model_dir)
     model_family = detect_model_family(model_config_data)
-    if args.enable_native_sessions and (model_family != "qwen" or len(devices) != 1 or args.prompt):
-        raise ValueError("Local sessions require a single-rank Qwen3 serving deployment")
+    if args.enable_native_sessions and args.prompt:
+        raise ValueError("--enable-native-sessions cannot be combined with --prompt")
     if args.max_num_batched_tokens is None:
         args.max_num_batched_tokens = 1024 if model_family == "deepseek_v41" else 4096
     if model_family == "deepseek_v41":
@@ -379,6 +379,7 @@ def build_serving_engine_config(args: argparse.Namespace) -> EngineConfig:
     return EngineConfig(
         model_id=args.served_model_name or Path(args.model).name,
         model_dir=model_dir,
+        model_family=model_family,
         platform=args.platform,
         device_id=first_group[0],
         device_ids=worker_device_ids,
@@ -480,6 +481,7 @@ def _build_v41_engine_config(args, model_dir, raw, devices):
     return EngineConfig(
         model_id=args.served_model_name or Path(model_dir).name,
         model_dir=model_dir,
+        model_family="deepseek_v41",
         platform=args.platform,
         device_id=devices[0],
         device_ids=devices,
@@ -961,6 +963,7 @@ def run_serve(
     port: int = 8000,
     native_sessions: bool = False,
     session_kv_mode: str = "input",
+    model_family: str = "qwen",
 ) -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -1002,6 +1005,7 @@ def run_serve(
             model_id,
             generate_config,
             session_kv_mode=session_kv_mode,
+            model_family=model_family,
         )
         app = native_server.app
     else:
@@ -1014,8 +1018,8 @@ def run_serve(
 
     @app.on_event("shutdown")
     async def shutdown():
-        if native_server is not None and native_server.objects is not None:
-            native_server.objects.close()
+        if native_server is not None:
+            native_server.close_objects()
         await async_engine.stop()
         merge_profile()
 
@@ -1237,6 +1241,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             port=args.port,
             native_sessions=args.enable_native_sessions,
             session_kv_mode=args.session_kv_mode,
+            model_family=config.model_family,
         )
     return 0
 

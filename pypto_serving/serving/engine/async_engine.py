@@ -86,6 +86,7 @@ class EngineConfig:
     # Model
     model_id: str = ""
     model_dir: str = ""
+    model_family: str = "qwen"
 
     # Device / executor
     platform: str = "a2a3"
@@ -1989,6 +1990,15 @@ class AsyncLLMEngine:
         if len(self._cores) != 1:
             raise AttributeError("scheduler and kv_cache_manager are only exposed for single-replica engines")
         return self._cores[0]
+
+    @property
+    def cores(self) -> tuple[ReplicaEngineCore, ...]:
+        """Return the serving cores for session-aware routing."""
+        return tuple(self._cores)
+
+    def select_replica(self) -> int:
+        """Select a replica using the same load policy as ordinary requests."""
+        return self._select_replica()
 
     def _tokenize_prompt(self, prompt: str) -> Sequence[int] | None:
         prompt_token_ids = self.tokenizer.encode(prompt)

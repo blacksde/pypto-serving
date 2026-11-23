@@ -1151,6 +1151,9 @@ class KvCacheManager:
         for name, pool in self._group_pools.items():
             token_capacity = pool.spec.spec.token_capacity
             ids = tables[name]
+            if not ids and not pool.spec.prefix_cacheable:
+                selected[name] = []
+                continue
             if (
                 pool.spec.sliding_window is not None
                 or pool.spec.is_eagle_group

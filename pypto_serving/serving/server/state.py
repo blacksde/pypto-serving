@@ -12,6 +12,7 @@ import uuid
 from pypto_serving.router.http import RouterError
 from pypto_serving.serving import request_timing as timing
 from .state_protocol import Binding, digest
+from .session_adapter import SessionKVAdapter
 
 
 def authorize(headers):
@@ -45,13 +46,10 @@ class _Object:
 class NativeObjects:
     """Keep one signed, boot-scoped reference to each retained input prefix."""
 
-    def __init__(self, cache, node, pins, model_identity=None, *, session_kv_mode="input"):
-        if (
-            node.contract.adapter != "qwen3-14b-paged"
-            or cache.group_names != ("kv",)
-            or cache.group_specs[0].spec.token_capacity != 128
-        ):
-            raise ValueError("Local retention requires the Qwen3-14B paged cache layout")
+    def __init__(self, cache, node, pins, model_identity=None, *, session_kv_mode="input", adapter=None):
+        self.adapter = adapter or SessionKVAdapter.from_cache("qwen", node.contract.model, cache)
+        if node.contract.adapter != self.adapter.adapter_id:
+            raise ValueError("Local retention contract does not match the model KV adapter")
         if session_kv_mode != "input":
             raise ValueError("Local retention supports input KV only")
         self.session_kv_mode = session_kv_mode
@@ -67,6 +65,8 @@ class NativeObjects:
     def parent_precheck(self, parent, scope):
         if parent is None:
             return {"state": "absent"}
+        if not self.adapter.supports_warm_prefix:
+            return {"state": "missing", "reason": "model_cache_requires_replay"}
         if (
             parent.get("node_id") == self.node.node_id
             and parent.get("model") == self.node.contract.model
@@ -89,9 +89,17 @@ class NativeObjects:
         actual = tuple(entry.continuation.tokens)
         if not chunk.final or chunk.end != len(actual):
             raise ValueError("Local retain requires the confirmed prompt")
-        boundary = chunk.end // 128 * 128
-        tables = {"kv": list(chunk.blocks["kv"][: boundary // 128])}
-        if len(tables["kv"]) != boundary // 128:
+        boundary = self.adapter.retained_boundary(chunk.end)
+        tables = {
+            name: list(chunk.blocks.get(name, ())[: boundary // self.adapter.block_size])
+            if name in self.adapter.cacheable_groups else []
+            for name in self.adapter.group_names
+        }
+        self.adapter.validate_tables(tables)
+        if any(
+            len(tables[name]) != boundary // self.adapter.block_size
+            for name in self.adapter.cacheable_groups
+        ):
             raise ValueError("Confirmed prompt does not have enough complete physical pages")
         receipt = dict(
             entry.native_scope,
@@ -105,11 +113,13 @@ class NativeObjects:
             durability="volatile",
             retained_tokens=boundary,
             confirmed_tokens=chunk.end,
-            block_size=128,
+            block_size=self.adapter.block_size,
             prefix_digest=digest(list(actual[:boundary])),
         )
         if self.model_identity is not None:
             receipt["model_identity_digest"] = self.model_identity
+        receipt["adapter_id"] = self.adapter.adapter_id
+        receipt["topology"] = self.adapter.topology_metadata(range(self.node.topology.ranks))
         if getattr(entry, "native_parent", None) is not None:
             receipt.update(mounted_tokens=entry.mounted_tokens, mounted_object_id=entry.native_parent["object_id"])
         snapshot = self.cache.retain_group_block_snapshot(tables, chunk.partition)
@@ -142,6 +152,7 @@ class NativeObjects:
         )
         if self.model_identity is not None:
             expected["model_identity_digest"] = self.model_identity
+        expected["adapter_id"] = self.adapter.adapter_id
         if any(receipt.get(key) != value for key, value in expected.items()):
             raise RouterError(409, "native_identity_mismatch", "Native object belongs to another engine")
         unsigned = dict(receipt)
@@ -195,14 +206,14 @@ class NativeObjects:
                 if old != new:
                     break
                 common += 1
-            expected = min(common, max(0, len(tokens) - 1)) // 128 * 128
+            expected = min(common, max(0, len(tokens) - 1)) // self.adapter.block_size * self.adapter.block_size
             if type(mount_tokens) is not int or mount_tokens != expected:
                 raise RouterError(409, "native_prefix_mismatch", "Requested mount differs from the actual prefix")
             boundary = mount_tokens
         return ConfirmedGroupPrefix(
             boundary,
             record.partition,
-            {name: tuple(ids[: boundary // 128]) for name, ids in record.blocks.items()},
+            {name: tuple(ids[: boundary // self.adapter.block_size]) for name, ids in record.blocks.items()},
         )
 
     def discard_request(self, request):

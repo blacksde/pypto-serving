@@ -14,6 +14,7 @@ from pypto_serving.serving.sched.scheduler import RequestStatus, Scheduler
 from .model_identity import load_model_identity
 from .server import ChatCompletionRequest, ServingServer
 from .state import NativeObjects, authorize
+from .session_adapter import SessionKVAdapter
 from .state_protocol import Component, Contract, Node, Topology, digest
 
 
@@ -67,20 +68,21 @@ class SessionScheduler(Scheduler):
 class NativeServer(ServingServer):
     """Expose ordinary Chat plus the database-backed C session path."""
 
-    def __init__(self, engine, model_id, generate, *, session_kv_mode="input"):
-        self.core = engine.single_core()
-        if len(engine.config.worker_device_ids()) != 1:
-            raise ValueError("Local sessions require one serving rank")
-        if not isinstance(self.core.scheduler, SessionScheduler):
-            raise ValueError("Local sessions require SessionScheduler")
-        if engine.config.executor_cls != "PyptoQwen14BExecutor":
-            raise ValueError("Local sessions require the Qwen3-14B executor")
+    def __init__(self, engine, model_id, generate, *, session_kv_mode="input", model_family="qwen"):
+        self._cores = engine.cores
+        if not self._cores:
+            raise ValueError("Local sessions require at least one serving core")
+        if any(not isinstance(core.scheduler, SessionScheduler) for core in self._cores):
+            raise ValueError("Local sessions require SessionScheduler on every serving core")
+        self.core = self._cores[0]
+        self.model_family = model_family
         if session_kv_mode != "input":
             raise ValueError("Local sessions support input KV retention only")
         self.session_kv_mode = session_kv_mode
         self.boot = uuid.uuid4().hex
         self.model_identity = load_model_identity(engine.config.model_dir, model_id, engine.tokenizer)
         self.objects = None
+        self._objects_by_replica = {}
         self.sessions = None
         super().__init__(engine, model_id, generate)
         if os.getenv("PYPTO_SESSION_DATABASE_URL"):
@@ -124,9 +126,9 @@ class NativeServer(ServingServer):
         return JSONResponse(
             {
                 "boot": self.boot,
-                "live_objects": len(self.objects.objects) if self.objects else 0,
+                "live_objects": sum(len(objects.objects) for objects in self._objects_by_replica.values()),
                 "pending_publications": self.sessions.candidates.qsize(),
-                "active_executions": len(self.core.scheduler.native_requests),
+                "active_executions": sum(len(core.scheduler.native_requests) for core in self._cores),
                 "database_pool": self.sessions.store.database.snapshot(),
             }
         )
@@ -146,18 +148,25 @@ class NativeServer(ServingServer):
         self.app.add_api_route("/internal/stateful/v3/delete", self.session_delete, methods=["POST"])
         self.app.add_api_route("/internal/stateful/v3/status", self.session_status, methods=["POST"])
 
-    def _objects(self):
+    def _objects(self, replica_idx=0):
         if not self.engine.is_ready():
-            raise RouterError(503, "native_unavailable", "Single engine is unavailable")
-        if self.objects is None:
-            cache = self.core.kv_cache_manager
+            raise RouterError(503, "native_unavailable", "Session engine is unavailable")
+        if not 0 <= replica_idx < len(self._cores):
+            raise RouterError(503, "native_unavailable", "Session replica is unavailable")
+        if replica_idx not in self._objects_by_replica:
+            core = self._cores[replica_idx]
+            cache = core.kv_cache_manager
             runtime = self.engine.config.resolve_runtime_config()
+            adapter = SessionKVAdapter.from_cache(self.model_family, self.model_id, cache)
+            devices = core.config.worker_device_ids()
             contract = Contract(
-                "qwen3-14b-paged",
+                adapter.adapter_id,
                 self.model_id,
                 digest(
                     {
-                        "deployment": "single",
+                        "deployment": "replica",
+                        "replica_idx": replica_idx,
+                        "model_family": self.model_family,
                         "session_kv_mode": self.session_kv_mode,
                         "runtime": runtime,
                         "groups": cache.group_specs,
@@ -166,22 +175,49 @@ class NativeServer(ServingServer):
                 (Component("key", "kv", "kv"), Component("value", "kv", "kv")),
             )
             node = Node(
-                "single",
-                "single",
+                f"replica-{replica_idx}",
+                "replica",
                 self.boot,
                 contract,
                 uuid.uuid4().hex,
-                Topology.for_tp(1, 1),
+                Topology.for_tp(len(devices), len(devices)),
             )
-            self.objects = NativeObjects(
+            objects = NativeObjects(
                 cache,
                 node,
                 SimpleNamespace(active={}),
                 self.model_identity["fingerprint"],
                 session_kv_mode="input",
+                adapter=adapter,
             )
-            self.core.scheduler.native_objects = self.objects
-        return self.objects
+            self._objects_by_replica[replica_idx] = objects
+            core.scheduler.native_objects = objects
+            if replica_idx == 0:
+                self.objects = objects
+        return self._objects_by_replica[replica_idx]
+
+    def select_replica(self):
+        return self.engine.select_replica()
+
+    def replica_for_receipt(self, receipt):
+        node_id = receipt.get("node_id") if isinstance(receipt, dict) else None
+        if isinstance(node_id, str) and node_id.startswith("replica-"):
+            try:
+                index = int(node_id.rsplit("-", 1)[1])
+            except ValueError:
+                return None
+            return index if 0 <= index < len(self._cores) else None
+        return None
+
+    def release_receipt(self, receipt):
+        replica_idx = self.replica_for_receipt(receipt)
+        if replica_idx is None:
+            return
+        self._objects(replica_idx).release(receipt)
+
+    def close_objects(self):
+        for objects in tuple(self._objects_by_replica.values()):
+            objects.close()
 
     def _budget(self, tokens, config):
         if len(tokens) + config.max_new_tokens > self.engine.config.resolve_runtime_config().max_seq_len:

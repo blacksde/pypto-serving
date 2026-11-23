@@ -17,6 +17,7 @@ import uuid
 
 import pytest
 
+from pypto_serving.config.parallel import ParallelConfig
 from pypto_serving.config.types import GenerateConfig, KVCacheGroupSpec, KVCacheSpec, RuntimeConfig
 from pypto_serving.serving.engine.async_engine import AsyncLLMEngine, EngineConfig, ReplicaEngineCore
 from pypto_serving.serving.server.native import NativeServer, SessionScheduler
@@ -123,6 +124,114 @@ def test_local_history_barrier_hot_continuation_and_cold_fallback(tmp_path, monk
             await server.sessions.close()
             if server.objects:
                 server.objects.close()
+            await engine.stop()
+
+    asyncio.run(run())
+
+
+def test_local_session_routes_parent_to_the_same_replica(tmp_path, monkeypatch):
+    url = os.getenv("PYPTO_SESSION_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("PYPTO_SESSION_TEST_DATABASE_URL is required")
+    monkeypatch.setenv("PYPTO_STATEFUL_INTERNAL_TOKEN", "single-stream-credential")
+    monkeypatch.setenv("PYPTO_SESSION_DATABASE_URL", url)
+    monkeypatch.setenv("PYPTO_SESSION_SCHEMA", "replica_test_" + uuid.uuid4().hex)
+    monkeypatch.setenv("PYPTO_SESSION_SECRET", "test-secret")
+    checkpoint(tmp_path)
+
+    async def run():
+        workers = [Worker(), Worker()]
+        for worker in workers:
+            worker.released.set()
+
+        def worker_factory(config):
+            return workers[config.dp_rank].factory(config)
+
+        runtime = RuntimeConfig(
+            page_size=128,
+            max_batch_size=2,
+            max_seq_len=512,
+            max_num_batched_tokens=512,
+            kv_cache_groups=(
+                KVCacheGroupSpec(
+                    "kv", (0,), KVCacheSpec(128, 128), 4,
+                    num_blocks=16, num_partitions=2, max_requests_per_partition=2,
+                ),
+            ),
+        )
+        config = EngineConfig(
+            model_id="Qwen3-14B",
+            model_dir=str(tmp_path),
+            runtime_config=runtime,
+            parallel_config=ParallelConfig(
+                data_parallel_size=2, tensor_parallel_size=1, devices=(0, 1),
+            ),
+            max_num_running_reqs=2,
+            max_num_scheduled_tokens=512,
+            enable_prefix_cache=False,
+        )
+        engine = AsyncLLMEngine(
+            config,
+            Tokenizer(),
+            core_factory=partial(
+                ReplicaEngineCore,
+                scheduler_factory=partial(SessionScheduler, session_kv_mode="input"),
+                worker_factory=worker_factory,
+            ),
+        )
+        await engine.start()
+        server = NativeServer(engine, "Qwen3-14B", GenerateConfig())
+        await server.sessions.start()
+        body = dict(
+            model="Qwen3-14B",
+            messages=[dict(role="user", content="first")],
+            max_completion_tokens=2,
+            temperature=0,
+            top_p=1,
+            chat_template_kwargs={"enable_thinking": False},
+            stateful_context=dict(
+                protocol="pypto-session-v3",
+                response_id="resp_replica_A",
+                tenant_id="one",
+                input_items=[dict(type="message", role="user", content="first")],
+            ),
+        )
+        try:
+            response = await server._chat_completions(
+                ChatCompletionRequest.model_validate(body), incoming("/chat", {})
+            )
+            assert json.loads(response.body)["choices"][0]["finish_reason"] == "length"
+            await asyncio.wait_for(server.sessions.candidates.join(), 3)
+            probe, parent = await server.sessions.db(
+                server.sessions.store.begin_request, "probe_replica", "one", "resp_replica_A"
+            )
+            await server.sessions.db(server.sessions.store.abort_request, probe)
+            parent_replica = server.replica_for_receipt(parent.binding)
+            assert parent_replica in (0, 1)
+
+            body["messages"] += [
+                dict(role="assistant", content="7 8"),
+                dict(role="user", content="next"),
+            ]
+            body["stateful_context"].update(
+                response_id="resp_replica_B",
+                parent_response_id="resp_replica_A",
+                policy="strict",
+                input_items=[dict(type="message", role="user", content="next")],
+            )
+            await server._chat_completions(
+                ChatCompletionRequest.model_validate(body), incoming("/chat", {})
+            )
+            await asyncio.wait_for(server.sessions.candidates.join(), 3)
+            probe, child = await server.sessions.db(
+                server.sessions.store.begin_request, "probe_replica_b", "one", "resp_replica_B"
+            )
+            await server.sessions.db(server.sessions.store.abort_request, probe)
+            assert server.replica_for_receipt(child.binding) == parent_replica
+            assert child.binding["mounted_tokens"] == 128
+        finally:
+            await server.sessions.close()
+            server.close_objects()
             await engine.stop()
 
     asyncio.run(run())
