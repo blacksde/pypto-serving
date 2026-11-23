@@ -179,8 +179,14 @@ class Qwen314BPyptoExecutor(CorePyptoExecutor):
         return Qwen314BModelRunner(
             compiled=compiled,
             device_id=self._device_ids[0],
+            device_ids=self._device_ids,
             hbg_prefill=self._chip_runtime == "host_build_graph",
         )
+
+    @property
+    def session_topology(self) -> tuple[int, ...]:
+        """Return the device topology carried by the compiled Qwen program."""
+        return self._device_ids
 
     def cache_group_sizes(self, model_id: str) -> dict[str, int]:
         """Report the device page count for the local session cache group."""

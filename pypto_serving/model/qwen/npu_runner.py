@@ -127,11 +127,15 @@ class Qwen314BModelRunner(L3DispatchMixin, ModelRunner):
         *,
         compiled: _CompiledKernels,
         device_id: int = 0,
+        device_ids: tuple[int, ...] | None = None,
         hbg_prefill: bool = False,
     ) -> None:
         super().__init__()
         self._compiled = compiled
         self._device_id = device_id
+        self._device_ids = tuple(device_ids or (device_id,))
+        if not self._device_ids or device_id not in self._device_ids:
+            raise ValueError("Qwen runner device topology must include the primary device")
         self._hbg_prefill = hbg_prefill
         self._cache_group_num_blocks: dict[str, int] = {}
         self._init_l3_dispatch(stacked=False)
